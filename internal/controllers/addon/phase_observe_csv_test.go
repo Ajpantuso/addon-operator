@@ -2,13 +2,13 @@ package addon
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -17,57 +17,89 @@ import (
 )
 
 func TestObserveCurrentCSV(t *testing.T) {
-
-	addon := &addonsv1alpha1.Addon{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "addon-mock",
-		},
-		Spec: addonsv1alpha1.AddonSpec{
-			Install: addonsv1alpha1.AddonInstallSpec{
-				Type: addonsv1alpha1.OLMOwnNamespace,
-				OLMOwnNamespace: &addonsv1alpha1.AddonInstallOLMOwnNamespace{
-					AddonInstallOLMCommon: addonsv1alpha1.AddonInstallOLMCommon{
-						CatalogSourceImage: "test",
-						Namespace:          "test",
-					},
-				},
-			},
-			SecretPropagation: &addonsv1alpha1.AddonSecretPropagation{
-				Secrets: []addonsv1alpha1.AddonSecretPropagationReference{
-					{
-						SourceSecret: corev1.LocalObjectReference{
-							Name: "test",
-						},
-						DestinationSecret: corev1.LocalObjectReference{
-							Name: "test",
-						},
-					},
-				},
-			},
-		},
+	type expected struct {
+		Conditions []metav1.Condition
+		Result     requeueResult
 	}
 
-	csv := &operatorsv1alpha1.ClusterServiceVersion{}
+	for name, tc := range map[string]struct {
+		CSV      *operatorsv1alpha1.ClusterServiceVersion
+		Expected expected
+	}{
+		"No CSV present": {
+			CSV: new(operatorsv1alpha1.ClusterServiceVersion),
+			Expected: expected{
+				Conditions: []metav1.Condition{unreadyCSVCondition("unkown/pending")},
+				Result:     resultRetry,
+			},
+		},
+	} {
+		tc := tc
 
-	c := testutil.NewClient()
-	c.
-		On("Get",
-			mock.Anything,
-			mock.IsType(client.ObjectKey{}),
-			mock.IsType(csv),
-		).Return(nil)
+		t.Run(name, func(t *testing.T) {
+			c := testutil.NewClient()
+			c.
+				On("Get",
+					mock.Anything,
+					mock.IsType(client.ObjectKey{}),
+					testutil.IsOperatorsV1Alpha1ClusterServiceVersionPtr,
+				).
+				Run(func(args mock.Arguments) {
+					tc.CSV.DeepCopyInto(args.Get(2).(*operatorsv1alpha1.ClusterServiceVersion))
+				}).
+				Return(nil)
 
-	r := &olmReconciler{
-		client: c,
-		scheme: testutil.NewTestSchemeWithAddonsv1alpha1(),
+			r := &olmReconciler{
+				client: c,
+				scheme: testutil.NewTestSchemeWithAddonsv1alpha1(),
+			}
+
+			var addon addonsv1alpha1.Addon
+
+			res, err := r.observeCurrentCSV(context.Background(), &addon, client.ObjectKey{})
+			require.NoError(t, err)
+
+			c.AssertExpectations(t)
+
+			assert.Equal(t, tc.Expected.Result, res)
+			assertEqualConditions(t, tc.Expected.Conditions, addon.Status.Conditions)
+		})
+	}
+}
+
+func unreadyCSVCondition(msg string) metav1.Condition {
+	return metav1.Condition{
+		Type:    addonsv1alpha1.Available,
+		Status:  metav1.ConditionFalse,
+		Reason:  addonsv1alpha1.AddonReasonUnreadyCSV,
+		Message: fmt.Sprintf("ClusterServiceVersion is not ready: %s", msg),
+	}
+}
+
+func assertEqualConditions(t *testing.T, expected []metav1.Condition, actual []metav1.Condition) {
+	t.Helper()
+
+	assert.ElementsMatch(t, dropConditionTransients(expected...), dropConditionTransients(actual...))
+}
+
+func dropConditionTransients(conds ...metav1.Condition) []nonTransientCondition {
+	res := make([]nonTransientCondition, 0, len(conds))
+
+	for _, c := range conds {
+		res = append(res, nonTransientCondition{
+			Type:    c.Type,
+			Status:  c.Status,
+			Reason:  c.Reason,
+			Message: c.Message,
+		})
 	}
 
-	secretKey := client.ObjectKey{Name: "test", Namespace: "test"}
+	return res
+}
 
-	ctx := context.Background()
-	requeueResult, err := r.observeCurrentCSV(ctx, addon, secretKey)
-
-	c.AssertExpectations(t)
-	require.NoError(t, err)
-	assert.NotNil(t, requeueResult)
+type nonTransientCondition struct {
+	Type    string
+	Status  metav1.ConditionStatus
+	Reason  string
+	Message string
 }
